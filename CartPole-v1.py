@@ -22,56 +22,69 @@ class ReplayBuffer:
         self.index = 0
         self.size = 0
         self.need_calculation = []
+        self.epsilon = 1e-5  # Para evitar prioridades zero
 
     def add(self, observation, action, reward):
-        self.buffer[self.index] = (observation, action, reward, np.nan, 1.0) # Inicializa a prioridade como 1.0 (ou outra constante)
+        # Inicializar future_returns como NaN e prioridade como zero
+        self.buffer[self.index] = (observation, action, reward, np.nan, 0.0)
         self.need_calculation.append(self.index)
-        self.size = max(self.index+1,self.size)
+        self.size = max(self.index + 1, self.size)
         self.index = (self.index + 1) % self.max_size
 
-    def sample(self, batch_size):
-        # Amostragem das experiências com base nas prioridades
-        probabilities = self.buffer["priorities"][:self.size] / np.sum(self.buffer["priorities"][:self.size])
-        sampled_indices = np.random.choice(self.size, size=batch_size, p=probabilities)
-        
-        # Retorna as amostras e suas prioridades
-        return self.buffer[sampled_indices], sampled_indices
-
-    def update_priorities(self, indices, new_priorities):
-        self.buffer["priorities"][indices] = new_priorities
-        
-    def compute_returns(self, gamma):        
+    def compute_returns(self, gamma):
         G = 0
         for i in reversed(self.need_calculation):
-            G = self.buffer['rewards'][i] + gamma * G  # Acumula a recompensa futura
-            self.buffer['future_returns'][i] = G  # Atualiza diretamente o histórico
+            G = self.buffer['rewards'][i] + gamma * G
+            self.buffer['future_returns'][i] = G
         self.need_calculation = []
 
+        # Calcular média e desvio padrão dos retornos futuros no buffer
+        valid_returns = self.buffer['future_returns'][:self.size]
+        mean_return = np.mean(valid_returns)
+        std_return = np.std(valid_returns) + self.epsilon  # Adicionar epsilon para evitar divisão por zero
+
+        # Atualizar prioridades com base no desvio em relação à média
+        for i in range(self.size):
+            G = self.buffer['future_returns'][i]
+            deviation = abs(G - mean_return) / std_return  # Número de desvios padrão da média
+            self.buffer['priorities'][i] = deviation + self.epsilon  # Adicionar epsilon para evitar prioridades zero
+
+    def sample(self, batch_size):
+        # Usar prioridades para calcular probabilidades de amostragem
+        priorities = self.buffer['priorities'][:self.size]
+        total_priority = np.sum(priorities)
+        if total_priority == 0:
+            # Se todas as prioridades forem zero (improvável), amostrar uniformemente
+            probabilities = np.ones(self.size) / self.size
+        else:
+            probabilities = priorities / total_priority
+
+        sampled_indices = np.random.choice(self.size, size=batch_size, p=probabilities)
+        samples = self.buffer[sampled_indices]
+        return samples, sampled_indices, probabilities[sampled_indices]
+
 def train(model, optimizer, replay_buffer, batch_size, beta=0.4):
-    historic, sampled_indices = replay_buffer.sample(batch_size)
+    samples, indices, sampling_probs = replay_buffer.sample(batch_size)
+
+    # Calcular pesos de importância
+    weights = (1.0 / (replay_buffer.size * sampling_probs)) ** beta
+    weights /= weights.max()  # Normalizar pesos para [0, 1]
     
-    # Calcular os pesos das amostras
-    probabilities = historic["priorities"] / np.sum(historic["priorities"])
-    weights = (len(historic) * probabilities) ** (-beta)
-    weights /= weights.max()  # Normaliza os pesos
-    
+    returns = samples['future_returns']
+    mean_return = np.mean(returns)
+    std_return = np.std(returns) + 1e-8  # Evitar divisão por zero
+    normalized_returns = (returns - mean_return) / std_return
+
     with tf.GradientTape() as tape:
-        logits = model(historic["observations"])
+        logits = model(samples['observations'])
         policy_distributions = tfp.distributions.Categorical(logits=logits)
-        log_probs = policy_distributions.log_prob(historic["actions"])
-    
-        mean = tf.reduce_mean(historic["future_returns"] )
-        std = tf.maximum(tf.math.reduce_std(historic["future_returns"]), 1e-12)
-        normalized_future_returns = (historic["future_returns"] - mean) / std
-    
-        loss = -tf.reduce_mean(weights * log_probs * normalized_future_returns)
-    
+        log_probs = policy_distributions.log_prob(samples['actions'])
+
+        loss = -tf.reduce_mean(weights * log_probs * normalized_returns)
+
         gradients = tape.gradient(loss, model.trainable_variables)
         optimizer.apply_gradients(zip(gradients, model.trainable_variables))
-        
-        # Calcule novas prioridades baseadas nas perdas
-        new_priorities = np.abs(loss.numpy()) + 1e-5  # Adicione um pequeno valor para evitar zero
-        replay_buffer.update_priorities(sampled_indices, new_priorities)
+
     return loss
 
 def preprocess_state(state):
@@ -97,24 +110,24 @@ def create_model(env):
 
 def save(model, losses, total_rewards, elapsed_times, episode, game):
     # Salvar os dados em um arquivo CSV
-    with open(f'./{game}/training_history.csv', mode='w', newline='') as file:
+    with open(f'./output/{game}/training_history.csv', mode='w', newline='') as file:
         writer = csv.writer(file)
         writer.writerow(['Episódio', 'Loss', 'Recompensa Total', 'Tempo (segundos)'])  # Cabeçalho
         for episode in range(len(losses)-1):
             writer.writerow([episode + 1, losses[episode], total_rewards[episode], elapsed_times[episode]])
     
-    model.save(f'./{game}/model_ep_{episode}_reward_{int(total_reward)}.keras')
+    model.save(f'./output/{game}/model_ep_{episode}_reward_{int(total_reward)}.keras')
 
 def moving_average(data, window_size):
     """Calcula a média móvel."""
     return np.convolve(data, np.ones(window_size) / window_size, mode='valid')
 
-def plot(losses, total_rewards, elapsed_times, episode, game):
+def plot(losses, total_rewards, elapsed_times, replay_buffer, episode, game):
     # Após o loop de treinamento, você pode plotar os gráficos
-    plt.figure(figsize=(10, 10))  # Aumenta a altura para acomodar mais gráficos
+    plt.figure(figsize=(10, 12))  # Aumenta a altura para acomodar mais gráficos
 
     # Gráfico de perda
-    plt.subplot(3, 1, 1)
+    plt.subplot(4, 1, 1)
     plt.plot(losses, label='Loss')
     if len(losses) >= 20:  # Certifica-se de que há dados suficientes
         plt.plot(np.arange(19, len(losses)), moving_average(losses, 20), color='black', linestyle='--', label='Média Móvel (20)')
@@ -124,7 +137,7 @@ def plot(losses, total_rewards, elapsed_times, episode, game):
     plt.legend()
 
     # Gráfico de recompensa total
-    plt.subplot(3, 1, 2)
+    plt.subplot(4, 1, 2)
     plt.plot(total_rewards, label='Recompensa Total', color='orange')
     if len(total_rewards) >= 20:
         plt.plot(np.arange(19, len(total_rewards)), moving_average(total_rewards, 20), color='black', linestyle='--', label='Média Móvel (20)')
@@ -134,7 +147,7 @@ def plot(losses, total_rewards, elapsed_times, episode, game):
     plt.legend()
 
     # Gráfico de tempo decorrido
-    plt.subplot(3, 1, 3)
+    plt.subplot(4, 1, 3)
     plt.plot(elapsed_times, label='Tempo Decorrido', color='green')
     if len(elapsed_times) >= 20:
         plt.plot(np.arange(19, len(elapsed_times)), moving_average(elapsed_times, 20), color='black', linestyle='--', label='Média Móvel (20)')
@@ -142,9 +155,23 @@ def plot(losses, total_rewards, elapsed_times, episode, game):
     plt.ylabel('Tempo (segundos)')
     plt.title('Tempo Decorrido por Episódio')
     plt.legend()
+
+    # Gráfico de relação entre Future Returns e Priorities
+    future_returns = replay_buffer.buffer['future_returns'][:replay_buffer.size]
+    priorities = replay_buffer.buffer['priorities'][:replay_buffer.size]
+    sorted_indices = np.argsort(future_returns)
+    sorted_returns = future_returns[sorted_indices]
+    sorted_priorities = priorities[sorted_indices]
+    
+    plt.subplot(4, 1, 4)
+    plt.plot(sorted_returns, sorted_priorities, marker='o', linestyle='-', color='b')
+    plt.xlabel('Future Returns (Ordenados)')
+    plt.ylabel('Priorities')
+    plt.title('Relação entre Future Returns e Priorities')
+    plt.grid(True)
     
     plt.tight_layout()
-    plt.savefig(f'./{game}/stats.png', dpi=300)
+    plt.savefig(f'./output/{game}/stats.png', dpi=300)
     plt.show()
 
 # Inicializando o ambiente CartPole-v1
@@ -157,8 +184,8 @@ env.render()
 model = create_model(env)
 
 optimizer = tf.keras.optimizers.Adam(learning_rate=0.01, decay=1e-6)
-gamma=0.95
-batch_size = 1024
+gamma=0.99
+batch_size = 4056
 epsilon = 0.1
 
 # Inicialize as listas para armazenar os valores
@@ -176,13 +203,10 @@ for episode in range(num_episodes):
     done = False
     total_reward = 0      
     while True:
-        if np.random.rand() < epsilon:  # Exploração
-            action = np.random.choice(env.action_space.n)
-        else:
-            state_input = np.expand_dims(state, axis=0)
-            action_probs = model.predict(state_input,verbose = 0)[0]
-            action = np.random.choice(len(action_probs), p=action_probs)  # Escolha da ação com base na distribuição de probabilidade
-            
+        state_input = np.expand_dims(state, axis=0)
+        action_probs = model.predict(state_input,verbose = 0)[0]
+        action = np.random.choice(len(action_probs), p=action_probs)  # Escolha da ação com base na distribuição de probabilidade
+        
         # Executando a ação no ambiente
         next_state, reward, done, info, _ = env.step(action)  # Corrigido aqui
         total_reward += reward
@@ -205,5 +229,5 @@ for episode in range(num_episodes):
             break
     if not episode%10:
         save(model, losses, total_rewards, elapsed_times, episode, game)
-        plot(losses, total_rewards, elapsed_times, episode, game)
+        plot(losses, total_rewards, elapsed_times, replay_buffer, episode, game)
         
