@@ -228,7 +228,7 @@ for episode in range(num_episodes):
             losses.append(loss)
             total_rewards.append(total_reward)
             elapsed_times.append(elapsed_time)
-            print("Episódio {}/{} - Recompensa: {} - loss {:.4f} - memorias {} - train_time {:.4f}".format(episode + 1, num_episodes, total_reward, loss, replay_buffer.index, elapsed_time))
+            print("Episódio {}/{} - Recompensa: {} - loss {:.4f} - memorias {} - train_time {:.4f} - dissatisfaction {}".format(episode + 1, num_episodes, total_reward, loss, replay_buffer.index, elapsed_time))
             break
     if not episode%10:
         save(model, losses, total_rewards, elapsed_times, episode, game)
