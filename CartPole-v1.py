@@ -96,5 +96,5 @@ for episode in range(num_episodes):
             break
     if not episode%1:
         utils.save(model, losses, total_rewards, elapsed_times, episode, game)
-        utils.plot(losses, total_rewards, elapsed_times, replay_buffer, priorities_dif, episode, game)
+        utils.plot(losses, total_rewards, elapsed_times, priorities_dif, episode, game)
         
